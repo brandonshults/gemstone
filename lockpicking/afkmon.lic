@@ -1,0 +1,98 @@
+=begin
+	Runs silently in the background waiting for someone in the friends array to attempt to hand you a box.
+	If conditions are correct for picking, call afkpicker to pick the box and then give it back to
+	the owner.  If conditions aren't correct, let the player know.
+=end
+status_tags
+no_pause_all
+no_kill_all
+setpriority(0)
+
+UserVars.boogerpicker = Hash.new
+
+friends = ["Geldan", "Warcamper", "Eggbert", "Sponge", "Chumpy", "Snoopy", "Clio", "Rupaul", "Panic", "Guardian"]
+
+paused = false
+paused_scripts = Array.new
+no_pause 				= [ Script.self.name, 'keepalive', 'narost', 'voodoo', 'deathrecover', 'go2', 'bountywindow', 'uberbarwiz' ]
+
+
+resume_scripts = proc {
+	return unless paused
+	smsg 'Resuming scripts', :all
+	wait_while { script_running?('go2') }
+	paused_scripts.each { |s| unpause_script(s) }
+	paused_scripts = Array.new
+	paused = false
+}
+
+pause_scripts = proc {
+	return if paused
+	smsg 'Pausing scripts', :all
+	for s in Script.running
+		unless s.paused
+			next if no_pause.include?(s.name)
+			smsg "-- ... pausing #{s.name}", :mono
+			paused_scripts << s.name
+			pause_script(s.name)
+		end
+	end
+	smsg '   ... complete', :mono
+	paused = true
+}
+
+
+
+
+before_dying {
+  resume_scripts.call
+}
+ 
+
+line = nil
+
+#Process each line.  Only react to that line if someone is attempting to hand you something.
+while line = script.gets
+  if line =~ /^<a exist=['"](.*?)['"] noun=['"](.*?)['"]>[A-Z][a-z]+<\/a> offers you.*?<a exist=['"](.*?)['"] noun=['"](.*?)['"].*?to accept the offer/
+    playerid = $1 ; playername = $2
+    itemid = $3 ; itemnoun = $4
+
+	#Only take action if the item is a valid box.
+    next if itemnoun !~ /box|strongbox|chest|coffer|trunk/
+
+	#Decline offers from non-friends.
+    if not friends.include?(playername)
+      fput "decline"
+      next
+    end
+
+	#Certain scripts are running that can't be interrupted, so decline the offer.
+    if running?("useherbs") or running?("selfpickee") or running?("boogerpicker")
+      fput "whisper #{playername} You, #{playername} (##{playerid}), tried to give me #{itemnoun} (#{itemid}) but I'm not ready for that yet."
+      fput "decline"
+      next
+    end
+
+
+	#Shut down all other scripts and accept the box.
+    pause_scripts.call
+    empty_hands
+    fput "whisper #{playername} You, #{playername} (##{playerid}), gave me #{itemnoun} (##{itemid})!"
+    result = dothistimeout "accept", 3, /You accept|no longer holding/
+    next if result =~ /no longer holding/
+    
+    start_script("afkpicker", ["#{itemid}"])
+    wait_while {running?("afkpicker")}
+
+	#The box is picked, give it back... If the owner can't be found, stow the box.
+    fput "decline"
+    result = dothistimeout "give ##{itemid} to ##{playerid}", 35, /accepted|declined|expired|What is it you're trying to give?/
+    if result =~ /expired|declined/
+      fput "whisper #{playername} Sorry, the offer wasn\'t accepted."
+      fput "stow ##{itemid}"
+    end
+
+    resume_scripts.call
+  end
+
+end

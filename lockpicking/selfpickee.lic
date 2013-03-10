@@ -1,0 +1,152 @@
+=begin
+	selfpickee.lic - Loop through all of a lockpicking characters inventory searching for boxes
+	and then using afkpicker to pick the ones that are found.
+=end
+status_tags
+
+loot_script = "sloot"
+
+GameObj.load_data if not defined?(GameObj.load_data)
+if not defined?(GameObj.load_data)
+  echo "You don't have GameObj.load_data.  Upgrade Lich.  That is all."
+  exit
+end
+
+paused = false
+paused_scripts  = Array.new
+no_pause 				= [ Script.self.name, 'keepalive', 'narost', 'voodoo', 'deathrecover', 'go2', 'bountywindow', 'uberbarwiz', 'afkmon' ]
+
+resume_scripts = proc {
+	return unless paused
+	smsg 'Resuming scripts', :all
+	wait_while { script_running?('go2') }
+	paused_scripts.each { |s| unpause_script(s) }
+	paused_scripts = Array.new
+	paused = false
+}
+
+pause_scripts = proc {
+	return if paused
+	smsg 'Pausing scripts', :all
+	for s in Script.running
+		unless s.paused
+			next if no_pause.include?(s.name)
+			smsg "-- ... pausing #{s.name}", :mono
+			paused_scripts << s.name
+			pause_script(s.name)
+      wait_while{!s.paused}
+		end
+	end
+	smsg '   ... complete', :mono
+	paused = true
+}
+
+
+before_dying { resume_scripts.call ; sleep 1}
+
+
+
+# boxes: keys are containerids,  values are arrays of boxes in container
+boxes = Hash.new
+
+#Add any boxes that are currently being held
+boxes['right'] = [GameObj.right_hand] if GameObj.right_hand.type.include?("box")
+boxes['left'] = [GameObj.left_hand] if GameObj.left_hand.type.include?("box")
+
+
+#Search all containers for boxes and add them to boxes
+GameObj.containers.each_pair { |container,contents|
+  fput "look in ##{container}" if contents.nil?			#Update the contents of a container if necessary
+  next if contents.nil?
+
+  contents.find_all { |box|
+    if box.type.include?('box')
+      boxes[container.id] = Array.new if not boxes.has_key?(container.id)
+      boxes[container.id].push(box)
+    end
+  }
+}
+
+#Check for a floating disk, if one is found, add any boxes inside to the boxes hash.
+sleep 2 if not disk = GameObj[/^.*#{Char.name} disk$/]
+disk = GameObj[/^.*#{Char.name} disk$/]
+if disk
+  dothistimeout "look in ##{disk.id}", 5, /In the .*?/ if not disk.contents
+  unless disk.contents
+    puts("failed to find contents of your disk")
+  end
+  boxes[disk.id] = Array.new if not boxes.has_key?(disk.id)
+  disk.contents.each {|item|
+    boxes[disk.id].push(item) if item.type.include?("box")
+  }
+end
+
+
+sleep 1
+pause_scripts.call
+pause_script("sbounty")
+
+empty_hands
+
+#Run afkpicker for each box in boxes.  Also handle looting and disposal of trash.
+boxes.each_key {|sack|
+  boxes[sack].each {|box|
+    wait_while {percentmind > 90}									#Wait until exp can be gained.
+    fput "get ##{box.id}"
+    start_script("afkpicker", ["#{box.id}"], { :quiet => true })
+    wait_while{running?("afkpicker")}
+
+    dothistimeout "open ##{box.id}", 1, /open/
+    fput "look in ##{box.id}"
+    dothistimeout "get coins from ##{box.id}", 1, /You gather/
+    waitrt?
+
+    start_script("sloot2", ["right"]) if GameObj.right_hand && GameObj.right_hand.type.include?("box")
+    wait_while{running?("sloot2")}
+    start_script("sloot2", ["left"]) if GameObj.right_hand && GameObj.left_hand.type.include?("box")
+    sleep 0.25
+    wait_while{running?("sloot2")}
+
+
+	
+    #Trash the box, taken from sloot
+    unless trash = (GameObj.room_desc.to_a + GameObj.loot.to_a).find { |obj| obj.noun =~ /(?:crate|barrel|wastebarrel|casket|wastebasket)$/ } || trash = (GameObj.room_desc.to_a + GameObj.loot.to_a).find { |obj| obj.noun =~ /box|chest|coffer|strongbox|trunk/ }
+      smsg "Unable to locate trash bin", true
+      trash = nil
+    end
+    if trash.nil?
+      dothistimeout "drop ##{box.id}", 1, /drop/ if holding?(box.id)
+    else
+      unless put_item(box.id.to_i, trash)
+        unless put_item(box.id.to_i, trash)
+          dothistimeout "drop ##{box.id}", 1, /drop/ if holding?(box.id)
+        end
+      end
+    end
+    sleep 2
+  }
+}
+
+#Make sure to turn in lockmastery task and get a new one if applicable.
+if not defined?(get_task)
+  start_script("grguild")
+  wait_while{ running?("grguild") }
+end
+
+if defined?(get_task) && get_task.find{|skill, task, reps| skill =~ /Lock Mastery/ && reps =~ /no/i}
+  cur = Room.current.id
+  start_script("grgvars", [])
+  wait_while{ running?("grgvars") }
+  start_script("grguild", ["start"])
+  wait_while{ running?("grguild") }
+  start_script("go2", [cur.to_s])
+  wait_while{running?("go2")}
+end
+
+
+#Sell the booty
+start_script(loot_script, ["sell"])
+wait_while{running?(loot_script)}
+
+
+resume_scripts.call

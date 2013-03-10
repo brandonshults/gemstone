@@ -1,0 +1,192 @@
+=begin
+	Loop through all of the boxes in the character's inventory and have them picked
+	by a locksmith who is found in the pickername array.  If no pickers are found,
+	wait for one unless the argument nowait is supplied when the script is run.
+=end
+status_tags
+pickername = ["Afkpicker"]
+
+loot_script = "sloot2"
+sell_script = "sloot"
+wait_mode = true
+
+wait_mode = false if script.vars[1] =~ /nowait/
+
+
+GameObj.load_data
+
+paused = false
+paused_scripts  = Array.new
+no_pause 				= [ Script.self.name, 'keepalive', 'narost', 'voodoo', 'deathrecover', 'go2', 'bountywindow', 'uberbarwiz' ]
+
+
+#Pause and Resume... stolen from Spiffy somewhere (I think)
+resume_scripts = proc {
+	return unless paused
+	smsg 'Resuming scripts', :all
+	wait_while { script_running?('go2') }
+	paused_scripts.each { |s| unpause_script(s) }
+	paused_scripts = Array.new
+	paused = false
+}
+
+pause_scripts = proc {
+	return if paused
+	smsg 'Pausing scripts', :all
+	for s in Script.running
+		unless s.paused
+			next if no_pause.include?(s.name)
+			smsg "-- ... pausing #{s.name}", :mono
+			paused_scripts << s.name
+			pause_script(s.name)
+      wait_while{!s.paused}
+		end
+	end
+	smsg '   ... complete', :mono
+	paused = true
+}
+
+
+before_dying { resume_scripts.call }
+
+
+pause_scripts.call
+
+#Find a valid picker in the room, wait for one if we are supposed to wait and none are present.
+picker = GameObj.pcs.find {|i| pickername.include?(i.noun) } || false
+if wait_mode
+  line = nil
+  while !picker && (percentencumbrance.to_i >= UserVars.op['encumbered'].to_i)
+    sleep 0.1
+    smsg "Waiting for a picker!", :all if Time.now.to_i % 20 == 0
+    picker = GameObj.pcs.find {|i| pickername.include?(i.noun) } || false
+  end
+end
+
+picker = picker.to_s if picker
+
+#Didn't find a valid picker, bail.
+exit unless picker
+
+# boxes: keys are containerids,  values are arrays of boxes in container
+#Find boxes in the inventory
+boxes = Hash.new
+GameObj.containers.each_key { |key|
+  container = GameObj[key]
+  next if not container
+  unless container.contents
+		dothistimeout "look in ##{container.id}", 5, /In the .*?|There is nothing in there/
+		unless container.contents
+			puts("could not read contents of #{container.name}")
+      next
+		end
+  end
+  
+  container.contents.find_all { |box|
+    if box.type.include?('box')
+      boxes[container.id] = Array.new if not boxes.has_key?(container.id)
+      boxes[container.id].push(box)
+    end
+  }
+}
+
+sleep 2
+
+#Find boxes in a floating disk.
+disk = GameObj.loot.find {|disk| disk.name =~ /#{Char.name} disk/}
+if disk
+  dothistimeout "look in ##{disk.id}", 5, /In the .*?/ if not disk.contents
+  unless disk.contents
+    puts("failed to find contents of your disk")
+  end
+  boxes[disk.id] = Array.new if not boxes.has_key?(disk.id)
+  disk.contents.each {|item|
+    boxes[disk.id].push(item) if item.type.include?("box")
+  }
+end
+
+
+sleep 0.5
+empty_hands
+
+#Loop through all boxes and hand them to the found picker.
+boxes.each_key {|sack|
+  boxes[sack].each {|box|
+    accepted = false
+    loop {
+	  #Make sure the picker is still present.
+      wait_until {checkpcs.include?(picker)} if wait_mode
+
+	  #if we know haste, then cast it on the picker to speed things up.
+      fput "get ##{box.id}"
+      Spell[506].cast(picker) if Spell[506].known? and Spell[506].affordable?
+
+	  #Attempt to give the box.
+      result = dothistimeout "give ##{box.id} to #{picker}", 50, /not ready for that|accepted|declined|expired|What is it you're trying to give/
+	  
+      if result == nil or result =~ /declined|expired|What is it you're trying to give/    #The picker didn't want this box, go on to the next one.
+        fput "put ##{box.id} in ##{sack}"
+        break
+      elsif result =~ /accepted/                                                           #Picker took the box, wait for them to hand it back.
+        accepted = true
+        break
+      elsif wait_mode && result =~ /not ready for that yet/i                               #Picker isn't ready and we don't mind waiting for them
+        fput 'cancel'                                                                      #Wait for them to tell us they are ready and then give it back.
+        line = 'nil'
+        while GameObj.pcs.find {|i| pickername.include?(i.noun)} && line !~ /Ready for your box!/i
+          line = get? ; sleep 0.1
+          smsg "Waiting for a picker!", :all if Time.now.to_i % 20 == 0
+        end
+        next
+      end
+    }
+	
+	#Wait for the box to be handed back.  Timeout after three minutes.
+    now = Time.now.to_f
+    while accepted && get !~ /ACCEPT|Confiscated your box/ && Time.now.to_f - now <= 180 ; end
+    fput "accept"
+    sleep 2
+
+	#Loot the box
+    fput "open ##{box.id}"
+    fput "get coins from ##{box.id}"
+    waitrt?
+    start_script(loot_script, ["right"]) if GameObj.right_hand.type.include?("box")
+    wait_while{running?(loot_script)}
+    start_script(loot_script, ["left"]) if GameObj.left_hand.type.include?("box")
+    sleep 1
+    wait_while{running?(loot_script)}
+    #fput "close ##{box.id}"
+
+
+
+    #Trash the box, taken from sloot
+    unless trash = (GameObj.room_desc.to_a + GameObj.loot.to_a).find { |obj| obj.noun =~ /^(?:crate|barrel|wastebarrel|casket|wastebasket)$/ } || trash = (GameObj.room_desc.to_a + GameObj.loot.to_a).find { |obj| obj.noun =~ /box|chest|coffer|strongbox|trunk/ }
+      smsg "Unable to locate trash bin", true
+      trash = nil
+    end
+    if trash.nil?
+      dothistimeout "drop ##{box.id}", 1, /drop/ if holding?(box.id)
+    else
+      unless put_item(box.id.to_i, trash)
+        unless put_item(box.id.to_i, trash)
+          dothistimeout "drop ##{box.id}", 1, /drop/ if holding?(box.id)
+        end
+      end
+    end
+
+
+    sleep 2
+  }
+}
+
+
+#Sell the booty.	
+start_script(sell_script, ["sell"])
+wait_while{running?(sell_script)}
+
+
+
+
+fill_hands
+resume_scripts.call

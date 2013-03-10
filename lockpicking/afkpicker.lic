@@ -1,0 +1,937 @@
+=begin
+#     afkpicker.lic - Will pick a box in your hand (or on the ground if you give it an id)
+#
+#     disarm:	Uses a hash whose keys are a unique string that the game gives when a trap
+#		is detected.  This way, after checking for a trap, all of the keys can be
+#		combined into a regular expression, and then checked against the game's text
+#		for a match.  If a match is found, we can directly access the value at that key
+#		which is another hash containing key/values such as: 
+#			:success    - successful disarm message.
+#			:disarmed   - trap has already been disarmed message.
+#			:pre/:post  - functions to run to prepare for and cleanup after the disarm.
+#
+#     picking:	Maintain a list of lockpicks that is sorted by effectiveness.  If the character
+#		knows the lock pick enhancement spell, the list will include only lored combinations
+#		that exceed the effectiveness of unlored lockpicks since using the spell results
+#		in a significant loss of experience.  The list is kept sorted so that we may
+#		iterate through the lockpicks in a linear fashion to be sure that we are using
+#		the lockpick which requires the highest roll so that experience is maximized.
+#		If a lock difficulty reading is found through lockmastery, this will select the
+#		proper pick.  If not it will default to DEFAULT_PICK.  if DEFAULT_PICK is not found				
+#		the script will forget about experience and use the best pick possible.  The script
+#		will attempt to pick a box with a given pick a maximum of MAX_ATTEMPTS_PER_PICK times.
+#		This will only occur when the character rolls a string of low numbers without a read on
+#		the lock.  Otherwise, if the character rolls a high number, such as 80, without a read,
+#		the number of attempts will be reduced because the perceived likelihood of being
+#		able to pick the box drops drastically.
+#
+#     general:	Since lockpicking kits, which contain the components necessary to disarm many traps,
+#		are different then other containers in the game, lich can not accurately keep track of
+#		their contents.  As such, this script also invisibly identifies you lockpick kit and 
+#		takes inventory each time it is run.
+#
+#
+#     #TODO:  Wedges, refill putty/cotton, check for missing tools disarm message 
+#             Add precedence for acid vial bundling clear > green > thick.
+#
+=end
+
+
+DEFAULT_PICK = "veniom"                #First pick to use if not measuring with calipers
+BROKEN_SACK = "mantle"                 #Where to put broken picks
+MAX_ATTEMPTS_PER_PICK = 5
+AUTO_REFILL_KITS = true
+
+#SHOULD_STOCKPILE = []#["jaw", "sliver of metal"]
+
+#Sort scripts be messing with my invisible hooks yo.  Pause them while I run.
+kill_list = ["sorter", "sorter2"]
+
+for s in kill_list
+  if running?(s)
+    kill_script(s)
+  else
+    kill_list.delete(s)
+  end
+end
+
+before_dying{
+  for s in kill_list
+    start_script(s)
+  end
+  $bp_restore_state ||= Array.new
+	for action in $bp_restore_state.pop
+		action.call
+	end
+}
+
+
+#Taken from lockpicks.lic.  Thanks Gib!
+MAX_TRAP = (Stats.dex[1] + Skills.to_bonus(Skills.disarmingtraps)).to_i
+LORED_TRAP = Stats.dex[1] + Skills.to_bonus(Skills.disarmingtraps) + (Stats.level / 2) + (Skills.to_bonus(Skills.disarmingtraps) / 10) + (Stats.agi[1] / 2) + (Stats.dis[1] / 2) if Spells.minorelemental >= 4
+LORED_TRAP = Stats.dex[1] + Skills.to_bonus(Skills.disarmingtraps) + ((Stats.level / 2) + (Skills.to_bonus(Skills.disarmingtraps) / 10) + (Stats.agi[1] / 2) + (Stats.dis[1] / 2)) / 2 if Spells.minorelemental < 4
+
+
+LOCKSMITH_ROOMS = [10434, 9491, 4663, 5724, 1881, 10943, 2425, 12282, 5612, 4024]
+
+
+LOCK_DIFF_HASH = {"amazingly complicated"=>1155, "extremely difficult"=>1035, "very well-crafted"=>635, "somewhat difficult"=>555, "easy"=>195, "unbelievably complicated"=>1435, "astoundingly complex"=>1195, "difficult"=>675, "well-crafted"=>475, "very easy"=>155, "impossibly complex"=>1485, "masterfully intricate"=>1395, "absurdly difficult"=>1355, "amazingly intricate"=>995, "impressively complicated"=>955, "intricate"=>835, "very difficult"=>755, "fairly simple"=>355, "incredibly intricate"=>1235, "fairly easy"=>275, "primitive"=>35, "absurdly well-crafted"=>1275, "moderately well-crafted"=>435, "very complex"=>915, "amazingly well-crafted"=>875, "fairly complicated"=>795, "exceedingly complex"=>1315, "moderately difficult"=>595, "simple"=>315, "very basic"=>235, "extremely easy"=>115, "rudimentary"=>75, "masterfully well-crafted"=>1115, "extremely complex"=>1075, "extremely well-crafted"=>715, "tricky"=>515, "fairly plain"=>395}
+
+
+#class Box_Picker
+  #def initialize(id)
+
+ #end
+  #attr_reader :measure_string, :lock_string
+  #attr_accessor :lockpicks, :tools, :kit, :attempt_score
+  
+  def trapped? ; @trapped ; end
+  def locked? ; @locked ; end
+  def trap_too_hard? ; @trap_too_hard ; end
+  def lock_to_hard? ; @lock_too_hard ; end
+
+  scarab_post = proc { waitrt? ; empty_hands ; result = dothistimeout "disarm scarab", 2, /knowing how delicate/ ; fput "get scarab" ; fput "stow scarab" ; fill_hands ; return result}
+  sphere_pre  = proc { @lockpicks = Lockpicks.new if !@lockpicks ; @lockpicks.get_pick}
+  sphere_post = proc { @lockpicks.store_pick}
+  scales_pre  = proc { @tools.get_dagger}
+  scales_post = proc { @tools.store_dagger}
+  store_cmpnt = proc { waitrt? ; fput "stow right" if GameObj.right_hand.name =~ /vial|jaws|needle|sphere|dark crystal/ ; fput "stow left" if GameObj.left_hand.name =~ /vial|jaws|needle|sphere|dark crystal/}
+
+  Traps = {
+    "scarab"             => {
+      :success => "nudge the scarab free of its prison",
+      :disarmed=> "free of all obstructions",
+      :post    => scarab_post },
+    "sliver of metal"    => {
+      :success => "manage to block the tiny hole|remove a slender steel needle",
+      :disarmed=> "completely plugged|indicate cause for alarm",
+      :name    => "poison needle",
+      :post    => store_cmpnt },
+    "jaws"               => {
+      :success => "pull out the two pins",
+      :disarmed=> "have been pushed out|has been removed",
+      :post    => store_cmpnt},
+    "sphere"             => {
+      :pre     => sphere_pre,
+      :success => "gem free of its metal housing",
+      :disarmed=> "seems to be empty now",
+      :post    => sphere_post },
+    "dark crystal"       => {
+      :success => "won't come in contact with the crystal",
+      :disarmed=> "have been ground away|which appears to be empty" },
+    "scales"             => {
+      :success => "slice through the cord",
+      :disarmed=> "have been sliced through",
+      :pre     => scales_pre,
+      :post    => scales_post },
+    "sulphur"            => {
+      :success => "blowing away in the wind",
+      :disarmed=> "a small hole in the bladder" },
+    "vial of liquid"     => {
+      :success => "bend the weak metal",
+      :disarmed=> "bent from striking range",
+      :name    => "gas cloud",
+      :post    => store_cmpnt },
+    "tiny vial"          => {
+      :success => "protecting the small vial",
+      :disarmed=> "it appears empty",
+      :name    => "acid vial",
+      :post    => store_cmpnt },
+    "springs"            => {
+      :success => "you manage to pop them inside",
+      :disarmed=> "discover no traps"  },
+    "fire-red liquid"    => {
+      :success => "bend the weak metal",
+      :disarmed=> "bent back slightly",
+      :name    => "fire vial",
+      :post    => store_cmpnt },
+    "small tube"         => {
+      :success => "block whatever it's meant to deploy",
+      :disarmed=> "has been plugged|torn mostly away",
+      :name    => "spore" },
+    "plate over the lock"=> {
+      :success => "begins to melt away",
+      :disarmed=> "granting sufficient access"},
+    "glyph"              => {
+      :success => "scrape some extra lines",
+      :disarmed=> "markings have been altered"  },
+    "rods"               => {
+      :success => "bend the sensitive metal rods",
+      :disarmed=> "bent in opposite directions"  },
+    "explosive mixture"  => {
+      :success => "cake a thin layer on the lock casing",
+      :disarmed=> "prevent it from igniting",
+      :name    => "boomer"}
+  }
+  DISARMED_STRING = Traps.values.collect {|x| x[:disarmed]}.compact.join("|")
+
+  #Stolen from slib.  Thanks Spiffy.  Simple, formatted output.
+  def smsg(msg, type = :none)
+    start_string = ""
+    end_string = ""
+
+    if type == :bold or type == :all
+      if $fake_stormfront
+        start_string += "\034GSL\r\n"
+        end_string += "\034GSM\r\n\r\n"
+      else
+        start_string += "<pushBold\/>"
+        end_string += "<popBold\/>"
+      end
+    end
+
+    if (type == :mono or type == :all) and not $fake_stormfront
+      start_string += "<output class=\"mono\"/>"
+      end_string += "\r\n<output class=\"\"/>"
+    end
+
+    puts sprintf '%s%s%s', start_string, msg, end_string
+  end
+  
+  
+
+  def trap_name
+    return Traps[@trap][:name] if Traps[@trap][:name]
+    return @trap
+  end
+
+  def find_nearest_w_time(target_list)
+    start_room = Room.current
+    least_time = nil
+    least_target = nil
+    previous, shortest_distances = Map.dijkstra(start_room.id)
+    for target in target_list
+      return target if start_room.id == target
+      est_time = shortest_distances[target]
+      if !est_time.nil? and (least_time.nil? or least_time > est_time)
+        least_target = target
+        least_time = est_time
+      end
+    end
+    least_target = nil unless least_target
+    return [least_target, least_time.to_i]
+  end
+
+
+  def measure()
+    return false if !@tools.get_calipers()
+    lock = dothistimeout "lm measure ##{@id}", 15, /^Measuring carefully, it looks to be an? .*? lock\.|Try measuring something with a lock|needs to be on the ground|Usage/
+    if lock =~ /Try measuring something with a lock|needs to be on the ground|isn\'t even closed/
+      smsg "Error: Something went wrong in Box_Picker.measure.", :all
+      exit
+    end
+    if lock !~ /Usage/
+      @measure_string = lock.match(/^Measuring carefully, it looks to be an? (.*?) lock./).captures[0]
+      @lock_diff = LOCK_DIFF_HASH[@measure_string]
+      if !@lock_diff
+        smsg "Error: Could not look up the measurement for \"#{@measure_string}\" lock.  Please notify AFKpicker.", :all
+      end
+    end
+    @tools.store_calipers()
+  end
+
+  ############## Log a detect/disarm attempt and return the result ###############
+  def trapcap(cmd)
+    disarmstring  = ""
+    done = disarmlogging = false
+    readtrap = proc { |server_string|
+      disarmstring += server_string  if disarmlogging
+      
+      if server_string =~ /You carefully begin to examine|Having discovered a trap.*?you/
+        disarmlogging = true
+      elsif server_string =~ /blink in surprise|What were you referring to\?|contortionist/
+        disarmstring = :not_valid
+        done = true
+      elsif server_string =~ /both hands free/
+        disarmstring = :full_hands
+        done = true
+      elsif server_string =~ /it's open/
+        disarmstring = :already_open
+        done = true
+      end
+
+      if server_string =~ /#{DISARMED_STRING}|Roundtime/
+        disarmlogging = false
+        done = true
+        DownstreamHook.remove('trapdownstream')
+      end
+      nil if not server_string
+      server_string
+    }
+
+    waitrt?
+    DownstreamHook.add('trapdownstream', readtrap)
+    before_dying{DownstreamHook.remove('trapdownstream')}
+    fput "#{cmd} ##{@id}"
+    wait_until {done}
+    waitrt?
+    return disarmstring
+  end
+
+  ################################################################################
+
+  #Returns :already_open, false, true
+  def detect
+    waitrt?
+    Spell[402].cast if Spell[402].known? && Spell[402].affordable? && !Spell[402].active?
+    detectstring = trapcap("detect")
+
+
+    if !detectstring || detectstring == :not_valid
+      smsg "Error: Something went wrong.  Most likely the box is open or not accessible.", :all
+      @trapped = false
+      exit
+    elsif detectstring == :full_hands
+      fput "stow left" if GameObj.left_hand.id != @id
+      fput "stow right" if GameObj.right_hand.id != @id
+    elsif detectstring == :already_open
+      smsg "The #{GameObj[@id.to_s]} was already open.", :all
+      exit
+    end
+
+    if detectstring =~ /(#{DISARMED_STRING})/
+      @trap      = Traps.keys.find {|i| Traps[i][:disarmed] =~ /#{$1}/} if $1
+      @trap_diff = 0
+      @trapped   = false
+    else
+      @trap      = detectstring.match(/(#{Traps.keys.join('|')})/).captures[0].to_s
+      @trap_diff = detectstring.match(/\(.*?(-[0-9]+)\)/).captures[0].to_i
+      @trapped   = true
+      if @trap_diff + LORED_TRAP < 20
+        @trap_too_hard = true
+        return false
+      end
+    end
+    return true
+  end
+
+  def disarm
+    return false if @trap == "scales" && locked?
+    Traps[@trap][:pre].call if Traps[@trap].has_key?(:pre)
+
+    use_lore = true if @difficulty + MAX_TRAP < 20
+
+    if @trap_diff + LORED_TRAP < 20
+      @trap_too_hard = true
+      return false
+    end
+
+    waitrt?
+    Spell[404].cast(Char.name) if not Spell[404].active? and use_lore
+    disarmstring = trapcap("disarm")
+
+    return false if disarmstring =~ /What were you referring to?|both hands free|contortionist|You blink in surprise/
+
+    @trapped = false if disarmstring =~ /#{Traps[@trap][:success]}|#{DISARMED_STRING}/
+
+    if disarmstring =~ /\(You have (\d+) (?:lumps?|vials?|balls?) of (putty|acid|cotton) remaining\.\)/
+      @kit.cotton = $1.to_i if $2 == "cotton"
+      @kit.acid = $1.to_i if $2 == "acid"
+      @kit.putty = $1.to_i if $2 == "putty"
+    end
+
+    Traps[@trap][:post].call if Traps[@trap].has_key?(:post)
+
+    return true
+  end
+
+
+  def pickcommand(rand=false)  # returns "lm ptrick <best trick>" or "picklock" #########
+    log = ""
+    logging = true
+    parse = proc { |server_string|
+      if server_string =~ /<output class=""\/>|Please rephrase that command|...wait/
+        DownstreamHook.remove("ptrick")
+        logging = false
+      end
+      log += server_string
+      nil
+    }
+
+    waitrt?
+    status_tags
+    DownstreamHook.add("ptrick", parse)
+    $_SERVER_.puts "#{$cmd_prefix}lm\n"
+    wait_while {logging}
+    status_tags
+    ptrick = log.scan(/spin|twist|turn|twirl|toss|bend/i)
+    ptrick = ptrick[rand(ptrick.length)] if rand
+    ptrick = ptrick[-1] if !rand
+
+    return "lm ptrick #{ptrick}" if ptrick
+    return "picklock"
+  end
+
+  def lockcap(cmd)
+    pickstring = String.new()
+    done = picklogging = false
+    lockhook = proc { |server_string|
+      pickstring += server_string  if picklogging
+      
+      if server_string =~ /You settle into the difficult task of picking the lock.|you spin|a sharp twist|gentle turn|you twirl|quick toss|carefully bend|quietly turn/
+        pickstring  = server_string
+        picklogging = true
+      elsif server_string =~ /using a broken lockpick\./
+        pickstring = :broken
+        done = true
+      elsif server_string =~ /not holding|pick a lock on what/
+        pickstring = :not_valid
+        done = true
+      elsif server_string =~ /Um, but it's open\./
+        pickstring = :already_open
+        done = true
+      elsif server_string =~ /not appear to be locked/
+        pickstring = :not_locked
+        done = true
+      end
+
+      if server_string =~ /you get a sense.*?Then...CLICK!  It opens!|tumblers snap open|not appear to be locked|Roundtime/
+        picklogging = false
+        done = true
+      end
+
+      nil if not server_string
+      server_string
+    }
+
+    waitrt?
+    DownstreamHook.add('lockhook', lockhook)
+    before_dying{DownstreamHook.remove('lockhook')}
+    fput "#{cmd} ##{@id}"
+    wait_until {done}
+    DownstreamHook.remove('lockhook')
+    sleep 0.5
+    waitrt?
+    return pickstring
+  end
+
+#You are not able to pick the lock, but you get a feeling that it is within your abilities.
+#Your lockpick gets stuck in the lock!  You carefully try to work it free, but it may have been weakened by the stress.
+#You are not able to pick the strongbox, but you get a sense that it has an easy lock.  About a -160 difficulty lock (in thief-lingo).
+#You struggle with the strongbox.  As you do, you get a sense that the strongbox has an easy lock (-160 thief-lingo difficulty ranking).  Then...CLICK!  It opens!
+#You make a good attempt (d100=75).
+#You are not able to pick the lock, but you get a feeling that it is within your abilities.
+
+  def picklock
+
+    # Map 100...1 to MAX_ATTEMPTS_PER_PICK...1 so that we can increment
+    # our attempts more for higher rolls that don't unlock the box
+    def scale(val,range=[1,100],to_range=[1,MAX_ATTEMPTS_PER_PICK])
+      (((val.to_f - range[0].to_f) /(range[1].to_f - range[0].to_f))*(to_range[1].to_f-to_range[2].to_f) + to_range[2].to_f).ceil
+    end
+
+    attempt = lockcap(pickcommand)
+
+    if attempt == :not_locked
+      @locked = false
+      return
+    elsif attempt == :not_valid
+      smsg "Error: Something went wrong.  Most likely the box is open or not accessible.", :all
+      exit
+    elsif attempt == :broken
+      @lockpicks.store_pick(true)
+    elsif attempt == :already_open
+      smsg "The #{GameObj[@id.to_s]} was already open.", :all
+      exit
+    end
+
+    roll = attempt.match(/You make an? .*? attempt \(d100(?:\(open\))?=([0-9]+)\)/).captures[0].to_i
+    @attempt_score += scale(roll)
+    @lock_diff = attempt.match(/(-[0-9]+)/).captures[0]
+
+    if attempt =~ /Then...CLICK!  It opens!|tumblers snap open/
+      @locked = false
+      @lock_string = attempt.match(/has an? (.*?) lock/).captures[0]
+    elsif attempt =~ /Your lockpick gets stuck in the lock!  You carefully try to work it free, but it may have been weakened by the stress\./
+      @attempt_score += (MAX_ATTEMPTS_PER_PICK/2).ceil
+    elsif attempt =~ /SNAP/
+      @lockpicks.store_pick(true)
+      @attempt_score += MAX_ATTEMPTS_PER_PICK
+    end
+
+  end
+#end
+
+
+# get_pick, store_pick, get_better_pick, get_worse_pick, need_lore?, refresh_pick
+class Lockpicks
+  def initialize(measurement=nil)
+    @lockpicks = Hash.new ; @containers = Hash.new ; @index = 9001 ; @lore_index = 9001
+
+    populate_picks()
+    select_pick(measurement)
+  end
+
+  def current_pick ; @lockpicks[@index][1][0] ; end
+  def need_lore? ; return true if @index >= @lore_index; false ; end
+  def found_picks? ;  return false if @lockpicks[@index].nil? ; return true ; end
+
+  Lockpick_data = {
+    "copper"       => 1.00,    "brass"        => 1.00,    "steel"        => 1.10,
+    "gold"         => 1.20,    "ivory"        => 1.20,    "silver"       => 1.30,
+    "mithril"      => 1.45,    "ora"          => 1.55,    "glaes"        => 1.60,
+    "laje"         => 1.75,    "vultite"      => 1.80,    "rolaren"      => 1.90,
+    "veniom"       => 2.20,    "invar"        => 2.25,    "alum"         => 2.30,
+    "golvern"      => 2.30,    "kelyn"        => 2.40,    "vaalin"       => 2.50}
+
+  def max_by_type(type)
+    mod = Lockpick_data[type]
+    return ((Skills.to_bonus(Skills.pickinglocks) + Stats.dex[1]) * mod).to_i
+  end
+  def max_by_lored_type(type)
+    mod = Lockpick_data[type]
+    return (((Stats.level / 2.0) + (Skills.pickinglocks / 10.0) + (Stats.dex[1] / 2.0) + (Stats.int[1] / 2.0) + 30 + Skills.to_bonus(Skills.pickinglocks) + Stats.dex[1]) * mod).floor.to_i if Spells.minorelemental >= 3
+    return (mod * (((Stats.level / 2) + (Skills.pickinglocks / 10) + (Stats.dex[1] / 2) + (Stats.int[1] / 2) + 30) / 2 + Skills.to_bonus(Skills.pickinglocks) + Stats.dex[1])).round.to_i unless Spells.minorelemental >= 3
+  end
+
+
+  #@lockpicks: [[max_lock,[GameObj picks with mod1]], [max_lock,[GameObj picks with mod2]] ... ]
+  #@containers[id of lockpick] => id of container it came from
+  #for the purpose of @lockpicks, max locks are stored as positive values
+  def populate_picks()
+    @lockpicks = Hash.new ; @containers = Hash.new ; @index = 9001 ; @lore_index = 9001
+    lored_picks = Hash.new
+    GameObj.containers.each_pair {|container,contents|
+      container = GameObj["#{container}"]
+      next if container.name =~ /#{BROKEN_SACK}/
+      fput "look in ##{container.id}" if contents.nil?
+      nect if contents.nil?
+      picks = contents.find_all {|i| i.name =~ /lockpick/i}
+      picks.each {|pick|
+        type = pick.name.match(/(#{Lockpick_data.keys.join("\\s+|")}\s+)/).captures[0].to_s.strip
+
+        #type = pick.name.match(/(#{Lockpick_data.keys.join("\s+|\s+")})/).captures[0].to_s
+        if !Lockpick_data.has_key?(type) || type == ""
+          smsg "Unknown lockpick: \"#{pick.name}\" found!  Please update Lockpick_data in afkpicker.lic.", :all
+          next
+        end
+
+        @containers[pick.id] ||= container.id
+        @lockpicks[max_by_type(type)] ||= Array.new
+        lored_picks[max_by_lored_type(type)] ||= Array.new
+        @lockpicks[max_by_type(type)].push(pick)
+        lored_picks[max_by_lored_type(type)].push(pick)
+      }
+    }
+    #sort @lockpicks by their max locks, then merge any lored_picks with higher max locks.
+    @lockpicks = @lockpicks.sort {|a,b| a[0] <=> b[0]}
+
+    if Spell['Lock Pick Enhance'].known?
+      lored_picks = lored_picks.sort {|a,b| a[0] <=> b[0]}
+      lored_picks = lored_picks.find_all {|a| a[0] > @lockpicks[-1][0]}
+      @lore_index = @lockpicks.length
+      @lockpicks += lored_picks
+      @lore_index = nil if @lore_index >= @lockpicks.length
+    end
+  end
+
+  
+  #Choose a pick.  If we know (or think we know) the difficulty, choose the
+  #appropriate pick.  Otherwise, use the default pick.  If we can't find it,
+  #use the best pick we can find.
+  def select_pick(measured=nil)
+    @index = @lockpicks.length-1
+
+    measured = LOCK_DIFF_HASH[measured] if measured.class != Fixnum && measured.class != Float
+
+    if measured #@index = @lockpicks.index {|x| x[0].to_f >= -measured}
+      for i in 0..@lockpicks.length-1
+        if @lockpicks[i][0] >= measured
+          @index = i
+          break
+        end
+      end
+      if @lockpicks[@index][0] < measured
+        pause_warning("This box is probably too difficult for you to open with one of the picks that were found.")
+      end
+    else #@index = @lockpicks.index {|x| x[1][0].name =~ /#{DEFAULT_PICK.gsub(/\s+/, ".*?")}/}
+      if @index.nil?
+        smsg "Error finding your default lockpick.  Please make sure you have one in an open container that is not your brokensack.", :all
+        exit
+      end
+      for i in 0..@lockpicks.length-1
+        if @lockpicks[i][1].find {|j| j.name =~ /#{DEFAULT_PICK}\s+/}
+          @index = i
+          break
+        end
+      end
+    end
+
+  end
+
+  def refresh_lore
+    Spell['Lock Pick Enhance'].cast if need_lore? && !Spell['Lock Pick Enhance'].active? && Spell['Lock Pick Enhance'].known?
+    fput "stop 403" if !need_lore? && Spell['Lock Pick Enhance'].active?
+  end
+
+  def refresh_pick
+    found_pick = [ GameObj.right_hand, GameObj.left_hand ].find_all {|x| x.name =~ /lockpick/}
+    found_pick.each {|pick| store_pick() unless pick.id == current_pick.id}
+    get_pick()
+    refresh_lore()
+  end
+
+  def get_pick
+    dothistimeout "get ##{current_pick.id}", 3, /You remove|Get what\?/
+    return false if !(GameObj.right_hand.id ==  current_pick.id || GameObj.left_hand.id == current_pick.id)
+    refresh_lore()
+  end
+
+  #Store a pick and repopulate @lockpicks
+  def store_pick(broken=false)
+    known_pick = [GameObj.right_hand, GameObj.left_hand].find {|x| x.noun == 'lockpick'}
+    if @containers[known_pick.id]
+      container = @containers[known_pick.id]
+      container = GameObj[BROKEN_SACK].id if broken
+      result = dothistimeout "_drag ##{known_pick.id} ##{container}",3,/#{known_pick.name}|^I could not find/
+    end
+    if (!@containers[known_pick.id] || result =~ /won't fit/) && [ checkright, checkleft ].include?('lockpick')
+      fput "stow lockpick"
+    end
+    diff = @lockpicks[@index][0]
+    populate_picks()
+    select_pick(diff)     #Repopulate @lockpicks with the current pick's max lock
+  end
+
+  def get_better_pick
+    store_pick()
+    @index += 1
+    if @index >= @lockpicks.length
+      pause_warning("This box is probably too difficult for you to open with one of the lockpicks that were found.")
+      return false
+    end
+    get_pick()
+  end
+
+  def get_worse_pick
+    store_pick()
+    @index -= 1
+    return false if @index < 0
+    get_pick()
+  end
+
+  def pause_warning(warn="Something unexpected happened.")
+    smsg "Warning: " + warn, :all
+    smsg "Type ;unpause #{Script.self.name} to continue or ;kill #{Script.self.name} to bail."
+    pause_script(Script.self.name)
+  end
+
+end
+
+
+def pickcommand(rand=false)  # returns "lm ptrick <best trick>" or "picklock" #########
+  log = ""
+  logging = true
+  parse = proc { |server_string|
+    if server_string =~ /<output class=""\/>|Please rephrase that command|...wait/
+      DownstreamHook.remove("ptrick")
+      logging = false
+    end
+    log += server_string
+    nil
+  }
+
+  waitrt?
+  status_tags
+  DownstreamHook.add("ptrick", parse)
+  $_SERVER_.puts "#{$cmd_prefix}lm\n"
+  wait_while {logging}
+  status_tags
+  ptrick = log.scan(/spin|twist|turn|twirl|toss|bend|flip/i)
+  ptrick = ptrick[rand(ptrick.length - 1)] if $bp_LM_ranks == 63
+  ptrick = ptrick[-1] if $bp_LM_ranks < 63
+
+  return "lm ptrick #{ptrick}" if ptrick
+  return "picklock"
+end
+
+class Kit
+  attr_reader :game_obj
+  attr_accessor :putty, :cotton, :acid
+  KIT_NOUNS = ["kit", "toolkit", "case"]
+  def initialize
+    @game_obj = nil ; @store_loc = nil
+    @putty = 0 ; @cotton = 0 ; @acid = 0
+    find_kit
+  end
+  
+  def find_kit(exclusions=nil)
+    @game_obj = GameObj.inv.find {|x| KIT_NOUNS.include?(x.noun.downcase) && !exclusions.include(x.id)}
+    if !update_and_validate()                 #check the inventory
+      GameObj.containers.each_pair { |container, contents|
+        fput "look in ##{container}" if contents.nil?
+        next if contents.nil?
+        kits = contents.find_all {|x|; KIT_NOUNS.include?(x.noun.downcase) && !exclusions.include(x.id)}
+        kits.each {|kit|
+          @game_obj = kit
+          if update_and_validate()
+            @store_loc = container
+            return true
+          end
+        }
+      }
+      @game_obj = nil
+      return false
+    end
+    @store_loc = :worn
+  end
+
+
+  #Check if a kit is valid... Also update putty, cotton, and acid since we
+  #are already looking in the kit.
+  ##FIXME: Careful review of this.  Look for optimizations.
+  def update_and_validate()
+    valid = :undecided
+    closed = done = false
+
+    kithook = proc {|server_string|
+      if server_string =~ /That is closed./i
+        closed = true
+        $_SERVER_.puts "#{$cmd_prefix}open ##{@game_obj.id}\n"
+        $_SERVER_.puts "#{$cmd_prefix}look in ##{@game_obj.id}\n"
+        $_SERVER_.puts "#{$cmd_prefix}yes\n"
+      elsif server_string =~ /you open/i
+        closed = false
+      elsif server_string =~ /a set of narrow metal grips/ && server_string =~ /a thin metal file/
+        #squishy white putty with about 12 pinches left, 69 little balls of cotton, a set of narrow metal grips, a thin metal file, a thick steel needle, 2 vials of liquid
+        @putty = server_string.match(/(\d+) pinch/).captures[0].to_i if server_string =~ /\d+ pinch/
+        @cotton = server_string.match(/(\d+) little ball/).captures[0].to_i if server_string =~ /\d+ little ball/
+        @acid = server_string.match(/(\d+) vial/).captures[0].to_i if server_string =~ /\d+ vials? of liquid/
+        valid = true
+      elsif (server_string =~ /A good positive attitude never hurts/ || server_string =~ /...wait/) && !closed
+        valid = false if valid == :undecided
+        done = true
+      end
+      DownstreamHook.remove("kithook") if done
+      nil
+    }
+    start_time = Time.now.to_f
+    DownstreamHook.add("kithook", kithook)
+    $_SERVER_.puts "#{$cmd_prefix}look in ##{@game_obj.id}\n"
+    $_SERVER_.puts "#{$cmd_prefix}yes\n"
+    wait_while{valid == :undecided && !done}
+    return valid
+  end
+
+  def ready_kit_for_bundle()
+    if GameObj.right_hand.id != @game_obj.id && GameObj.left_hand.id != @game_obj.id
+      result = dothistimeout "remove ##{@game_obj.id}", 3, /You remove|You aren't wearing|Get what?|You already have|Remove what\?/
+      fput "get ##{@game_obj.id}" if result =~ /You aren't wearing|Remove what\?/
+      if GameObj.right_hand.id != @game_obj.id && GameObj.left_hand.id != @game_obj.id
+        return false
+      end
+    end
+
+    fput "swap" if GameObj.left_hand.id == @game_obj.id
+    fput "stow left" if GameObj.left_hand.noun
+    return true
+
+  end
+
+  def perform_bundle()
+    fput "swap" if GameObj.right_hand.id != @game_obj.id
+    return false if GameObj.right_hand.id != @game_obj.id
+
+    result = dothistimeout "bundle", 3, /^You add|^You can't bundle that|^You do not have anything to bundle|no more room/
+    return false if result =~ /^You can't bundle that|^You do not have anything to bundle|no more room/
+    return true
+  end
+
+  def put_kit_back()
+    fput "wear ##{@game_obj.id}" if @store_loc == :worn
+    fput "drag ##{@game_obj.id} ##{@store_loc}" if @store_loc != :worn
+  end
+
+
+  def refill_if_needed
+    return if !AUTO_REFILL_KITS || (@putty > 0 && @cotton > 0 && @acid >= 10)
+    empty_hands
+
+    if @acid < 10
+      vials = Array.new
+      GameObj.containers.each_pair {|container,contents|
+        fput "look in ##{container}" if contents.nil?
+        next if contents.nil?
+        vials += contents.find_all {|item| item.name =~ /(?:clear) glass vial/} #|green-tinted|thick
+      }
+      return if !ready_kit_for_bundle()
+      vials.each {|vial|
+        break if @acid >= 10
+        fput "get ##{vial.id}"
+        if perform_bundle()
+          @acid += 1
+        else
+          fput "stow ##{vial.id}"
+          break
+        end
+      }
+
+      if @putty <= 0 || @cotton <= 0
+        smsg "Determined that your toolkit is out of #{"putty" if @putty <= 0}#{" and " if @putty <= 0 && @cotton <= 0}#{"cotton" if @cotton <= 0}.", :all
+        smsg "Automatic refilling for putty and cotton is not yet implemented.  Please refill your kit.", :all
+      end
+
+      put_kit_back()
+
+    end
+    #room, timeto = find_nearest_w_time(LOCKSMITH_ROOMS)
+
+    fill_hands
+  end
+end
+
+
+class Pick_Tools
+  DAGGER_NOUNS = ["dagger", "hook-knife", "alfange", "basilard", "bodkin", "cinquedea", "dirk", "knife", "kozuka", "misericord", "parazonium", "pavade", "poignard", "pugio", "scramasax", "spike", "stiletto", "tanto", "knife"]
+  attr_reader :kit, :dagger, :calipers, :picks
+  def initialize
+    @calipers = nil ; @dagger = nil
+    @cal_container = nil ; @dagg_container = nil
+    GameObj.containers.each_pair {|container, contents|
+      fput "look in ##{container}" if contents.nil?
+      next if contents.nil?
+      if !@dagger
+       @dagger = contents.find{|x| DAGGER_NOUNS.include?(x.noun.downcase) }
+       @dagg_container = GameObj[container] if @dagger
+      end
+      if !@calipers
+       @calipers = contents.find{ |x| x.noun.downcase == 'calipers' }
+       @cal_container = GameObj[container] if @calipers
+      end
+       break if @calipers && @dagger
+    }
+  end
+
+  def get_calipers
+    dothistimeout "get ##{@calipers.id}", 3, /You remove|Get what\?/
+    return (GameObj.right_hand.id == @calipers.id or GameObj.left_hand.id == @calipers.id)
+  end
+
+  def get_dagger
+    dothistimeout "get ##{@dagger.id}", 3, /You remove|Get what\?/
+    return (GameObj.right_hand.id == @dagger.id or GameObj.left_hand.id == @degger.id)
+  end
+
+  def store_calipers
+    until GameObj.right_hand.id != @calipers.id && GameObj.left_hand.id != @calipers.id
+      dothistimeout "_drag ##{@calipers.id} ##{@cal_container.id}", 3, /^You put|Not all drag and drop/
+    end
+  end
+
+  def store_dagger
+    until GameObj.right_hand.id != @dagger.id && GameObj.left_hand.id != @dagger.id
+      dothistimeout "_drag ##{@dagger.id} ##{@dagg_container.id}", 3, /^You put|Not all drag and drop/
+    end
+  end
+
+  def calibrate(id=nil)
+    id = id.id if id.type == GameObj
+    return if !@calipers
+    if get_calipers()
+      dothistimeout "lm calibrate ##{calipers.id} #{"with ##{id}" if GameObj[id.to_s]}", 3, /you make some effort to fine-tune|Those calipers could not be more perfectly calibrated/
+      waitrt?
+      return store_calipers()
+    end
+    return false
+  end
+  
+end
+
+
+######################## Now let's actually do stuff. ###########################
+
+
+
+if $bp_LM_ranks.nil?
+  res = dothistimeout "gld", 3, /Lock Mastery|GLD MENU|You have no guild affiliation/
+  $bp_LM_ranks = 63 if res =~ /You are a Master of Lock Mastery/
+  $bp_LM_ranks = 0 if res =~ /GLD MENU|You have no guild affiliation/
+  res = res.match(/You have (\d+) ranks in the Lock Mastery skill/).captures[0].to_i
+  $bp_LM_ranks = res if $bp_LM_ranks.nil?
+end
+
+
+box_obj = GameObj[script.vars[1]]
+box_obj = GameObj.right_hand if script.vars[1] =~ /right/i
+box_obj = GameObj.right_left if script.vars[1] =~ /left/i
+box_obj = [GameObj.right_hand, GameObj.left_hand].find{|x| x.type.include?("box")} if !box_obj
+
+
+if !box_obj
+  smsg 'Unknown box!  Please send the box ID, "right", or "left" as the script\'s first parameter.', :all
+  exit
+end
+
+@id = box_obj.id
+
+fput "swap" if GameObj.left_hand.id == @id
+empty_left_hand
+$bp_restore_state = $fill_left_hand_actions
+
+
+@trapped = true ; @trap = nil ; @trap_diff = nil
+@trap_too_hard = false
+@locked = true ; @lock_diff = nil ; @measure_string = nil
+@lock_string = nil ; @attempt_score = 0
+
+@kit = Kit.new ; @tools = Pick_Tools.new
+@lockpicks = Lockpicks.new
+
+
+
+if !@lockpicks.found_picks?
+  smsg "Did not find any valid lockpicks in your open (non-broken) containers.", :all
+  exit
+end
+
+if @kit.game_obj.nil?
+  smsg "Did not find a valid lockpicking kit in your inventory or open containers.", :all
+  exit
+end
+
+
+detect()
+
+exit if @trap == "plate over the lock" && (@kit.acid.nil? || @kit.acid < 1)
+
+if trap_too_hard?
+  smsg "Sorry, the trap on this box is too dangerous for you to automate.", :all
+  exit
+end
+
+while trapped? && trap_name != "scales"
+  disarm()
+  Spell[404].cast if trapped? && Spell[404].known? && Spell[404].affordable? && !Spell[404].active?
+end
+
+if trap_name == "scales" && !@tools.dagger
+  smsg "Didn't find a valid dagger to disarm this scales trap, so not picking the box.", :all
+  exit
+end
+
+measure() if $bp_LM_ranks >= 6
+
+@lockpicks.select_pick(@measure_string)
+
+@lockpicks.get_pick()
+while locked?
+  picklock()
+  if @attempt_score >= MAX_ATTEMPTS_PER_PICK && locked?
+    @attempt_score = 0
+    @lockpicks.get_better_pick()
+  end
+end
+
+@lockpicks.store_pick()
+
+while trapped? #Always lore up on scales
+  Spell[404].cast if trapped? && Spell[404].known? && Spell[404].affordable? && !Spell[404].active?
+  disarm()
+end
+
+@tools.calibrate(@id) if @lock_string && (@measure_string != @lock_string) && $bp_LM_ranks >= 10
+
+@kit.refill_if_needed()
+
+
+exit
